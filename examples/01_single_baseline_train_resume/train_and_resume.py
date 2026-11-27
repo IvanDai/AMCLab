@@ -48,13 +48,15 @@ def main() -> None:
         seq_length=train_ds.seq_length,
     )
 
-    # 3. Phase 1: Initial training
+    # 3. Phase 1: Initial training (default lr_scheduler="plateau" with factor=0.5, patience=3, min_lr=1e-6)
+    #    You can also pass a torch.optim.lr_scheduler instance/class or callable, e.g.:
+    #    lr_scheduler=lambda opt: torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="max", factor=0.5, patience=3, min_lr=1e-6)
     print(f"\n>>> Phase 1: Training {MODEL_NAME} for {PHASE1_EPOCHS} epochs")
     trainer = Trainer(
         model=model,
         optimizer="adamw",
         lr=1e-3,
-        scheduler="cosine",
+        lr_scheduler="plateau",
         device="auto",
         save_dir=SAVE_DIR,
         seed=SEED,

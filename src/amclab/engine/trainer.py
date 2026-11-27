@@ -6,10 +6,11 @@ import csv
 import json
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Type, Union
 
 import torch
 import torch.nn as nn
+from torch.optim.lr_scheduler import LRScheduler, ReduceLROnPlateau
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
@@ -23,22 +24,31 @@ from amclab.utils.runtime import (
     set_rng_state,
 )
 
+SchedulerLike = Union[
+    str,
+    LRScheduler,
+    ReduceLROnPlateau,
+    Type[LRScheduler],
+    Type[ReduceLROnPlateau],
+    Callable[[torch.optim.Optimizer], Any],
+    None,
+]
+
 
 class Trainer:
     """Keras-style PyTorch Trainer tailored for Automatic Modulation Classification.
 
     Features:
         - Auto-detects NVIDIA CUDA, Apple MPS, or CPU and adapts ``pin_memory`` / AMP.
+        - Flexible ``lr_scheduler`` parameter accepting:
+            1. Built-in string presets: ``"plateau"`` (default: ``factor=0.5, patience=3, min_lr=1e-6``),
+               ``"cosine"``, ``"step"``, or ``"none"`` / ``None``.
+            2. A pre-instantiated ``torch.optim.lr_scheduler`` object (e.g., ``ReduceLROnPlateau(opt, ...)``).
+            3. A ``torch.optim.lr_scheduler`` class (instantiated with ``lr_scheduler_kwargs``)
+               or a factory callable ``fn(optimizer) -> scheduler``.
         - Live ``tqdm`` progress bars displaying loss, accuracy, learning rate, and samples/sec.
         - Atomic checkpoint saving (``best.pt`` and ``last.pt``) with optimizer, scheduler,
           and RNG state for exact resumption or additional epochs (``extra_epochs``).
-
-    Example::
-
-        trainer = Trainer(model, optimizer="adamw", lr=1e-3, scheduler="cosine", save_dir="./runs/exp1")
-        history = trainer.fit(train_ds, val_ds, epochs=50, batch_size=128)
-        # Continue training for 20 more epochs:
-        trainer.fit(train_ds, val_ds, extra_epochs=20, resume_from="./runs/exp1/checkpoints/last.pt")
     """
 
     def __init__(
@@ -47,7 +57,8 @@ class Trainer:
         optimizer: str | torch.optim.Optimizer = "adamw",
         lr: float = 1e-3,
         weight_decay: float = 1e-4,
-        scheduler: Optional[str] = "cosine",
+        lr_scheduler: SchedulerLike = "plateau",
+        lr_scheduler_kwargs: Optional[Dict[str, Any]] = None,
         loss_fn: Optional[nn.Module] = None,
         label_smoothing: float = 0.0,
         grad_clip: Optional[float] = 1.0,
@@ -62,8 +73,8 @@ class Trainer:
         self.model = model.to(self.device)
         self.lr = float(lr)
         self.weight_decay = float(weight_decay)
-        self.scheduler_name = (scheduler or "none").lower() if isinstance(scheduler, str) else "custom"
-        self.custom_scheduler = None if isinstance(scheduler, str) or scheduler is None else scheduler
+        self.lr_scheduler_spec = lr_scheduler
+        self.lr_scheduler_kwargs = dict(lr_scheduler_kwargs or {})
         self.criterion = loss_fn if loss_fn is not None else nn.CrossEntropyLoss(label_smoothing=float(label_smoothing))
         self.grad_clip = grad_clip
         self.use_amp = bool(use_amp) and (self.device.type == "cuda")
@@ -93,18 +104,55 @@ class Trainer:
             return torch.optim.SGD(params, lr=self.lr, momentum=0.9, weight_decay=self.weight_decay)
         raise ValueError(f"Unsupported optimizer '{opt}'. Choose from: adamw, adam, sgd.")
 
-    def _build_scheduler(self, total_epochs: int):
-        if self.custom_scheduler is not None:
-            return self.custom_scheduler
-        if self.scheduler_name in ("none", "null", ""):
+    def _build_scheduler(self, total_epochs: int) -> Any:
+        spec = self.lr_scheduler_spec
+        kw = dict(self.lr_scheduler_kwargs)
+
+        if spec is None:
             return None
-        if self.scheduler_name == "cosine":
-            return torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=max(total_epochs, 1), eta_min=1e-6)
-        if self.scheduler_name == "step":
-            return torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=max(1, total_epochs // 3), gamma=0.5)
-        if self.scheduler_name == "plateau":
-            return torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode="max", factor=0.5, patience=4, min_lr=1e-6)
-        raise ValueError(f"Unsupported scheduler '{self.scheduler_name}'. Choose from: cosine, step, plateau, none.")
+
+        # 1. String preset
+        if isinstance(spec, str):
+            name = spec.strip().lower()
+            if name in ("none", "null", ""):
+                return None
+            if name == "plateau":
+                kw.setdefault("mode", "max")
+                kw.setdefault("factor", 0.5)
+                kw.setdefault("patience", 3)
+                kw.setdefault("min_lr", 1e-6)
+                return ReduceLROnPlateau(self.optimizer, **kw)
+            if name == "cosine":
+                kw.setdefault("T_max", max(total_epochs, 1))
+                kw.setdefault("eta_min", 1e-6)
+                return torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, **kw)
+            if name == "step":
+                kw.setdefault("step_size", max(1, total_epochs // 3))
+                kw.setdefault("gamma", 0.5)
+                return torch.optim.lr_scheduler.StepLR(self.optimizer, **kw)
+            raise ValueError(
+                f"Unsupported lr_scheduler preset '{spec}'. Choose from: plateau, cosine, step, none, "
+                "or pass a torch.optim.lr_scheduler instance/class/callable."
+            )
+
+        # 2. Pre-instantiated PyTorch scheduler object
+        if isinstance(spec, (LRScheduler, ReduceLROnPlateau)):
+            if getattr(spec, "optimizer", None) is not self.optimizer:
+                raise ValueError(
+                    "The passed lr_scheduler instance is bound to a different optimizer than Trainer.optimizer. "
+                    "Pass the same optimizer object to Trainer(optimizer=opt, lr_scheduler=sched), "
+                    "or pass a scheduler class / callable factory (e.g., lambda opt: ...)."
+                )
+            return spec
+
+        # 3. Scheduler class (e.g. torch.optim.lr_scheduler.ReduceLROnPlateau) or factory callable(optimizer)
+        if callable(spec):
+            return spec(self.optimizer, **kw) if kw else spec(self.optimizer)
+
+        raise TypeError(
+            f"Unsupported lr_scheduler type: {type(spec).__name__}. "
+            "Expected a preset string, a torch.optim.lr_scheduler instance/class, a callable, or None."
+        )
 
     def _save_checkpoint(self, filename: str, epoch: int, scheduler: Any, bad_epochs: int) -> Optional[Path]:
         if self.save_dir is None:
@@ -148,19 +196,7 @@ class Trainer:
         early_stopping: Optional[int] = 15,
         resume_from: Optional[str | Path] = None,
     ) -> List[Dict[str, Any]]:
-        """Train (or resume training) the model on ``train_dataset`` with optional validation.
-
-        Args:
-            train_dataset: PyTorch Dataset returning ``(iq, label, snr)``.
-            val_dataset: Optional validation Dataset.
-            epochs: Total target epochs (e.g., ``epochs=50``).
-            extra_epochs: When resuming, train this many additional epochs beyond the checkpoint epoch.
-            batch_size: Training mini-batch size.
-            eval_batch_size: Validation batch size (defaults to ``2 * batch_size``).
-            num_workers: Number of DataLoader worker processes.
-            early_stopping: Stop if validation accuracy does not improve for this many epochs (None to disable).
-            resume_from: Path to a saved ``last.pt`` or ``best.pt`` checkpoint to continue training from.
-        """
+        """Train (or resume training) the model on ``train_dataset`` with optional validation."""
         pin_memory = self.device.type == "cuda"
         eval_bs = eval_batch_size or (batch_size * 2)
 
@@ -280,8 +316,12 @@ class Trainer:
 
             cur_lr = float(self.optimizer.param_groups[0]["lr"])
             if scheduler is not None:
-                if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                    scheduler.step(val_acc if val_dataset is not None else train_acc)
+                if isinstance(scheduler, ReduceLROnPlateau):
+                    if getattr(scheduler, "mode", "max") == "min":
+                        metric = val_loss if val_dataset is not None else train_loss
+                    else:
+                        metric = val_acc if val_dataset is not None else train_acc
+                    scheduler.step(metric)
                 else:
                     scheduler.step()
 

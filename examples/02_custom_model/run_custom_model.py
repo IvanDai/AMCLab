@@ -42,7 +42,7 @@ def main() -> None:
             model=model,
             optimizer="adamw",
             lr=1e-3,
-            scheduler="cosine",
+            lr_scheduler="plateau",
             device="auto",
             save_dir=save_dir,
             seed=SEED,

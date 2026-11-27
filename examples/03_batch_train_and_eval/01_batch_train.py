@@ -48,7 +48,7 @@ def main() -> None:
             model=model,
             optimizer="adamw",
             lr=LR,
-            scheduler="cosine",
+            lr_scheduler="plateau",
             device="auto",
             save_dir=save_dir,
             seed=SEED,
