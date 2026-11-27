@@ -1,42 +1,17 @@
-"""Self-contained CNN1 (VT-CNN2, O'Shea et al., 2016) baseline model."""
-
-from __future__ import annotations
-
-import torch
-import torch.nn as nn
-
+"""CNN1: native PyTorch architecture port of AMR-Benchmark."""
+from torch import nn
 
 class CNN1(nn.Module):
-    """VT-CNN2 adapted for variable IQ sequence lengths ``[B, 2, L]``."""
 
-    def __init__(
-        self,
-        num_classes: int = 11,
-        seq_length: int = 128,
-        channels: int = 256,
-        dropout: float = 0.5,
-    ):
+    def __init__(self, num_classes=11, seq_length=128, dropout=0.5):
         super().__init__()
-        c2 = max(32, channels // 3)
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(1, channels, kernel_size=(1, 3), padding=(0, 1)),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-        )
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(channels, c2, kernel_size=(2, 3), padding=(0, 1)),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-        )
-        self.pool = nn.AdaptiveAvgPool2d((1, 8))
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(c2 * 8, 256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(256, num_classes),
-        )
+        if seq_length not in (128, 1024):
+            raise ValueError('seq_length must be 128 or 1024.')
+        self.seq_length = int(seq_length)
+        self.features = nn.Sequential(nn.Sequential(nn.Conv2d(1, 50, (1, 8), padding='same'), nn.ReLU()), nn.Dropout(dropout), nn.Sequential(nn.Conv2d(50, 50, (2, 8), padding=0), nn.ReLU()), nn.Dropout(dropout))
+        self.classifier = nn.Sequential(nn.Linear(50 * (seq_length - 7), 256), nn.ReLU(), nn.Dropout(dropout), nn.Linear(256, num_classes))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.conv2(self.conv1(x.unsqueeze(1)))
-        return self.classifier(self.pool(h))
+    def forward(self, x):
+        if x.ndim != 3 or x.shape[1:] != (2, self.seq_length):
+            raise ValueError(f'Expected [B,2,{self.seq_length}], got {tuple(x.shape)}')
+        return self.classifier(self.features(x.unsqueeze(1)).flatten(1))

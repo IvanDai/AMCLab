@@ -1,245 +1,192 @@
-"""Self-contained IQFormer (Shao et al., IEEE TCCN 2024).
-
-Computes its STFT time-frequency branch internally from raw IQ ``[B, 2, L]``
-so its public signature strictly follows ``forward(x: Tensor) -> Tensor``.
-Includes lightweight, base, and large variants in this single module.
+"""IQFormer (WestdoorSad/IQFormer, MIT, Copyright 2024 Shao Mingyuan).
+Defaults match main.py for RML2016 and HisarMod2019. For RML2018, L=1024
+uses the HisarMod architecture as an explicitly undocumented transfer.
 """
-
-from __future__ import annotations
-
-from typing import Sequence
-
 import torch
-import torch.nn as nn
-from torch.nn.init import trunc_normal_
+from torch import nn
+from torch.nn import functional as F
 
-
-class _DropPath(nn.Module):
-    def __init__(self, drop_prob: float = 0.0):
+class DropPath(nn.Module):
+    def __init__(self,p=0.):
         super().__init__()
-        self.drop_prob = float(drop_prob)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.drop_prob == 0.0 or not self.training:
+        self.p=p
+    def forward(self,x):
+        if not self.training or self.p==0:
             return x
-        keep = 1.0 - self.drop_prob
-        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-        mask = (keep + torch.rand(shape, dtype=x.dtype, device=x.device)).floor_()
-        return x.div(keep) * mask
+        keep=1-self.p
+        mask=x.new_empty((x.shape[0],)+(1,)*(x.ndim-1)).bernoulli_(keep)
+        return x*mask.div_(keep)
 
+def _init_weights(m):
+    if isinstance(m,nn.Conv1d):
+        nn.init.trunc_normal_(m.weight,std=.02)
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+    elif isinstance(m,(nn.BatchNorm1d,nn.BatchNorm2d)):
+        nn.init.zeros_(m.bias)
+        nn.init.ones_(m.weight)
 
-class _PatchEmbed1D(nn.Module):
-    def __init__(self, patch_size: int, stride: int, padding: int, in_chans: int, embed_dim: int):
+class ConvEncoder_IQ(nn.Module):
+    def __init__(self,dim,hidden_dim):
         super().__init__()
-        self.proj = nn.Conv1d(in_chans, embed_dim, kernel_size=patch_size, stride=stride, padding=padding)
-        self.norm = nn.BatchNorm1d(embed_dim)
+        self.dwconv=nn.Conv1d(dim,dim,3,padding=1,groups=dim)
+        self.norm=nn.BatchNorm1d(dim)
+        self.pwconv1=nn.Conv1d(dim,hidden_dim,1)
+        self.act=nn.GELU()
+        self.pwconv2=nn.Conv1d(hidden_dim,dim,1)
+        self.drop_path=nn.Identity()
+        self.layer_scale=nn.Parameter(torch.ones(dim,1))
+        self.apply(_init_weights)
+    def forward(self,x):
+        return x+self.layer_scale*self.pwconv2(self.act(self.pwconv1(self.norm(self.dwconv(x)))))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+class LocalRepresentation(ConvEncoder_IQ):
+    def __init__(self,dim):
+        super().__init__(dim,dim)
+
+class FCN(nn.Module):
+    def __init__(self,dim,hidden,drop=0.):
+        super().__init__()
+        self.norm1=nn.BatchNorm1d(dim)
+        self.fc1=nn.Conv1d(dim,hidden,1)
+        self.act=nn.GELU()
+        self.fc2=nn.Conv1d(hidden,dim,1)
+        self.drop=nn.Dropout(drop)
+        self.apply(_init_weights)
+    def forward(self,x):
+        return self.drop(self.fc2(self.drop(self.act(self.fc1(self.norm1(x))))))
+
+class EfficientAdditiveAttnetion(nn.Module):
+    def __init__(self,dim):
+        super().__init__()
+        self.to_query=nn.Linear(dim,dim)
+        self.to_key=nn.Linear(dim,dim)
+        self.w_g=nn.Parameter(torch.randn(dim,1))
+        self.scale_factor=dim**-.5
+        self.Proj=nn.Linear(dim,dim)
+        self.final=nn.Linear(dim,dim)
+    def forward(self,x):
+        q=F.normalize(self.to_query(x),dim=-1)
+        k=F.normalize(self.to_key(x),dim=-1)
+        a=F.normalize((q@self.w_g)*self.scale_factor,dim=1)
+        g=(a*q).sum(dim=1,keepdim=True)
+        return self.final(self.Proj(g*k)+q)
+
+class IQFormer_Encoder(nn.Module):
+    def __init__(self,dim,mlp_ratio,drop_path,use_layer_scale=False,layer_scale_init_value=1e-5):
+        super().__init__()
+        self.local_representation=LocalRepresentation(dim)
+        self.attn=EfficientAdditiveAttnetion(dim)
+        # Stage in upstream does not forward drop_rate to FCN.
+        self.linear=FCN(dim,int(dim*mlp_ratio),drop=0.)
+        self.drop_path=DropPath(drop_path) if drop_path>0 else nn.Identity()
+        self.use_layer_scale=use_layer_scale
+        if use_layer_scale:
+            self.layer_scale_1=nn.Parameter(layer_scale_init_value*torch.ones(dim,1))
+            self.layer_scale_2=nn.Parameter(layer_scale_init_value*torch.ones(dim,1))
+    def forward(self,x):
+        x=self.local_representation(x)
+        y=self.attn(x.transpose(1,2)).transpose(1,2)
+        if self.use_layer_scale:
+            y=self.layer_scale_1*y
+        x=x+self.drop_path(y)
+        y=self.linear(x)
+        if self.use_layer_scale:
+            y=self.layer_scale_2*y
+        return x+self.drop_path(y)
+
+class Fusion(nn.Module):
+    def __init__(self,channels,drop):
+        super().__init__()
+        self.Conv=nn.Sequential(nn.Conv1d(channels,channels*2,1),nn.BatchNorm1d(channels*2),
+            nn.GELU(),nn.Conv1d(channels*2,channels*2,1))
+        self.drop=nn.Dropout(drop)
+        self.apply(_init_weights)
+    def forward(self,x,stft):
+        return self.drop(self.Conv(torch.cat((x,stft),dim=1)))
+
+class Embedding(nn.Module):
+    def __init__(self,cin,cout,k,stride,pad):
+        super().__init__()
+        self.proj=nn.Conv1d(cin,cout,k,stride=stride,padding=pad)
+        self.norm=nn.BatchNorm1d(cout)
+    def forward(self,x):
         return self.norm(self.proj(x))
 
-
-class _ConvEncoderIQ(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int, kernel_size: int = 3, drop_path: float = 0.0, use_layer_scale: bool = True):
-        super().__init__()
-        self.dwconv = nn.Conv1d(dim, dim, kernel_size=kernel_size, padding=kernel_size // 2, groups=dim)
-        self.norm = nn.BatchNorm1d(dim)
-        self.pwconv1 = nn.Conv1d(dim, hidden_dim, kernel_size=1)
-        self.act = nn.GELU()
-        self.pwconv2 = nn.Conv1d(hidden_dim, dim, kernel_size=1)
-        self.drop_path = _DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
-        self.use_layer_scale = use_layer_scale
-        if use_layer_scale:
-            self.layer_scale = nn.Parameter(torch.ones(dim, 1))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.pwconv2(self.act(self.pwconv1(self.norm(self.dwconv(x)))))
-        if self.use_layer_scale:
-            y = self.layer_scale * y
-        return x + self.drop_path(y)
-
-
-class _FCN(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int, drop: float = 0.0):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.BatchNorm1d(dim),
-            nn.Conv1d(dim, hidden_dim, 1),
-            nn.GELU(),
-            nn.Dropout(drop),
-            nn.Conv1d(hidden_dim, dim, 1),
-            nn.Dropout(drop),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
-class _EfficientAdditiveAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int = 1):
-        super().__init__()
-        self.to_query = nn.Linear(dim, dim * num_heads)
-        self.to_key = nn.Linear(dim, dim * num_heads)
-        self.w_g = nn.Parameter(torch.randn(dim * num_heads, 1))
-        self.scale = dim ** -0.5
-        self.proj = nn.Linear(dim * num_heads, dim * num_heads)
-        self.final = nn.Linear(dim * num_heads, dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, N, D]
-        q = torch.nn.functional.normalize(self.to_query(x), dim=-1)
-        k = torch.nn.functional.normalize(self.to_key(x), dim=-1)
-        a = torch.nn.functional.normalize((q @ self.w_g) * self.scale, dim=1)
-        g = torch.sum(a * q, dim=1, keepdim=True).expand(-1, k.shape[1], -1)
-        return self.final(self.proj(g * k) + q)
-
-
-class _IQFormerBlock(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        mlp_ratio: float = 4.0,
-        drop: float = 0.0,
-        drop_path: float = 0.0,
-        use_layer_scale: bool = True,
-        layer_scale_init: float = 1e-5,
-    ):
-        super().__init__()
-        self.local_rep = _ConvEncoderIQ(dim, dim, kernel_size=3, drop_path=0.0, use_layer_scale=True)
-        self.attn = _EfficientAdditiveAttention(dim, num_heads=1)
-        self.fcn = _FCN(dim, int(dim * mlp_ratio), drop=drop)
-        self.drop_path = _DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
-        self.use_layer_scale = use_layer_scale
-        if use_layer_scale:
-            self.ls1 = nn.Parameter(layer_scale_init * torch.ones(dim, 1))
-            self.ls2 = nn.Parameter(layer_scale_init * torch.ones(dim, 1))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.local_rep(x)
-        attn_out = self.attn(x.transpose(1, 2)).transpose(1, 2)
-        if self.use_layer_scale:
-            x = x + self.drop_path(self.ls1 * attn_out)
-            x = x + self.drop_path(self.ls2 * self.fcn(x))
-        else:
-            x = x + self.drop_path(attn_out)
-            x = x + self.drop_path(self.fcn(x))
-        return x
-
+def reference_stft(iq):
+    # Equivalent to scipy.signal.stft(iq[0], 1., 'blackman', 31, 30, 128)
+    # followed by the upstream conversion to a real float32 Tensor.
+    signal=iq[:,0].float()
+    window=torch.blackman_window(31,periodic=True,device=signal.device,dtype=signal.dtype)
+    frames=F.pad(signal,(15,15)).unfold(-1,31,1)
+    spec=torch.fft.rfft(frames*window,n=128,dim=-1)/window.sum()
+    return spec.real[...,:32].transpose(1,2).unsqueeze(1).contiguous().to(iq.dtype)
 
 class IQFormer(nn.Module):
-    """Multi-modality IQ + STFT Transformer for Automatic Modulation Classification."""
-
-    def __init__(
-        self,
-        num_classes: int = 11,
-        seq_length: int = 128,
-        layers: Sequence[int] = (2, 2, 2),
-        embed_dims: Sequence[int] = (64, 64, 64),
-        mlp_ratio: float = 4.0,
-        down_patch_size: int = 5,
-        down_stride: int = 3,
-        down_pad: int = 1,
-        drop_rate: float = 0.2,
-        drop_path_rate: float = 0.1,
-        stft_freq_bins: int = 32,
-        vit_num: int = 1,
-    ):
+    def __init__(self,num_classes=11,seq_length=128,layers=None,embed_dims=(64,64,64),
+                 mlp_ratio=4.,down_patch_size=3,down_stride=2,down_pad=1,
+                 drop_rate=.2,drop_path_rate=None,use_layer_scale=False,
+                 layer_scale_init_value=1e-5,stft_freq_bins=32,vit_num=1):
         super().__init__()
-        self.stft_freq_bins = int(stft_freq_bins)
-        self.bn_iq = nn.BatchNorm1d(2)
-        self.bn_stft = nn.BatchNorm2d(1)
-
-        half_dim = embed_dims[0] // 8
-        self.stem_iq = nn.Sequential(
-            nn.Conv1d(2, half_dim, kernel_size=5, stride=1, padding=2, groups=2),
-            nn.BatchNorm1d(half_dim),
-        )
-        self.stem_stft = nn.Sequential(
-            nn.Conv2d(1, half_dim, kernel_size=(self.stft_freq_bins, 1), stride=1),
-            nn.BatchNorm2d(half_dim),
-            nn.ReLU(inplace=True),
-        )
-        fused_in = half_dim * 2
-        self.fusion = nn.Sequential(
-            nn.Conv1d(fused_in, embed_dims[0] // 2, kernel_size=1),
-            nn.BatchNorm1d(embed_dims[0] // 2),
-            nn.GELU(),
-            nn.Conv1d(embed_dims[0] // 2, embed_dims[0] // 2, kernel_size=1),
-            nn.Dropout(drop_rate),
-        )
-        self.patch_lstm = nn.LSTM(
-            input_size=embed_dims[0] // 2,
-            hidden_size=embed_dims[0] // 2,
-            bidirectional=True,
-            batch_first=True,
-            num_layers=2,
-            dropout=drop_rate,
-        )
-
-        # Build hierarchical Conv + IQFormer stages
-        total_blocks = max(sum(layers) - 1, 1)
-        stages = []
-        block_cursor = 0
-        for stage_idx, depth in enumerate(layers):
-            dim = embed_dims[stage_idx]
-            blocks = []
-            for b_idx in range(depth):
-                dpr = drop_path_rate * (block_cursor + b_idx) / total_blocks
-                if depth - b_idx <= vit_num:
-                    blocks.append(_IQFormerBlock(dim, mlp_ratio=mlp_ratio, drop=drop_rate, drop_path=dpr))
+        if seq_length not in (128, 1024):
+            raise ValueError("seq_length must be 128 or 1024.")
+        self.seq_length = int(seq_length)
+        if layers is None:
+            layers=(2,3,2) if seq_length==128 else (3,3,3)
+        if drop_path_rate is None:
+            drop_path_rate=0. if seq_length==128 else .2
+        if stft_freq_bins!=32:
+            raise ValueError("The reference STFT has 32 frequency bins.")
+        if len(layers)!=len(embed_dims) or embed_dims[0]%16:
+            raise ValueError("Stage depths/dimensions must align and first dim must be divisible by 16.")
+        self.layers=tuple(layers)
+        self.embed_dims=tuple(embed_dims)
+        self.BN=nn.BatchNorm1d(2)
+        self.BN_stft=nn.BatchNorm2d(1)
+        c=embed_dims[0]//8
+        self.patch_embedIQ=nn.Sequential(nn.Conv1d(2,c,5,padding=2,groups=2),nn.BatchNorm1d(c))
+        self.patch_embedSTFT=nn.Sequential(nn.Conv2d(1,c,(32,1)),nn.BatchNorm2d(c),nn.ReLU())
+        self.fusion=Fusion(embed_dims[0]//4,drop_rate)
+        network=[]
+        for i,(depth,dim) in enumerate(zip(layers,embed_dims)):
+            stage=[]
+            for j in range(depth):
+                dpr=drop_path_rate*(sum(layers[:i])+j)/max(sum(layers)-1,1)
+                if depth-j<=vit_num:
+                    stage.append(IQFormer_Encoder(dim,mlp_ratio,dpr,use_layer_scale,layer_scale_init_value))
                 else:
-                    blocks.append(_ConvEncoderIQ(dim, int(dim * mlp_ratio), kernel_size=3))
-            block_cursor += depth
-            stages.append(nn.Sequential(*blocks))
-            if stage_idx < len(layers) - 1 and embed_dims[stage_idx] != embed_dims[stage_idx + 1]:
-                stages.append(
-                    _PatchEmbed1D(down_patch_size, down_stride, down_pad, embed_dims[stage_idx], embed_dims[stage_idx + 1])
-                )
-        self.stages = nn.ModuleList(stages)
-        self.norm = nn.BatchNorm1d(embed_dims[-1])
-        self.pool = nn.Sequential(nn.AdaptiveAvgPool1d(1), nn.Flatten())
-        self.head = nn.Linear(embed_dims[-1], num_classes)
-        self.apply(self._init_weights)
+                    stage.append(ConvEncoder_IQ(dim,int(dim*mlp_ratio)))
+            network.append(nn.Sequential(*stage))
+            if i<len(layers)-1 and dim!=embed_dims[i+1]:
+                network.append(Embedding(dim,embed_dims[i+1],down_patch_size,down_stride,down_pad))
+        self.network=nn.ModuleList(network)
+        d=embed_dims[0]//2
+        self.patch_LSTM=nn.LSTM(d,d,bidirectional=True,batch_first=True,num_layers=2,dropout=drop_rate)
+        self.norm=nn.BatchNorm1d(embed_dims[-1])
+        self.head=nn.Linear(embed_dims[-1],num_classes)
+        self.apply(_init_weights)
+        self.globalavgpool=nn.Sequential(nn.AdaptiveAvgPool1d(1),nn.Flatten())
+        self.globalmaxpool=nn.Sequential(nn.AdaptiveMaxPool1d(1),nn.Flatten())
+    def _compute_stft(self,iq):
+        return reference_stft(iq)
+    def forward(self,x,stft=None):
+        if x.ndim != 3 or x.shape[1:] != (2, self.seq_length):
+            raise ValueError(f"Expected [B,2,{self.seq_length}], got {tuple(x.shape)}")
+        if stft is None:
+            stft=self._compute_stft(x)
+        if stft.shape!=(x.shape[0],1,32,self.seq_length):
+            raise ValueError("STFT must have shape [B,1,32,L].")
+        a=self.patch_embedIQ(self.BN(x))
+        b=self.patch_embedSTFT(self.BN_stft(stft)).squeeze(2)
+        h,_=self.patch_LSTM(self.fusion(a,b).transpose(1,2))
+        h=h.transpose(1,2)
+        for block in self.network:
+            h=block(h)
+        return self.head(self.globalavgpool(self.norm(h)))
 
-    @staticmethod
-    def _init_weights(m: nn.Module) -> None:
-        if isinstance(m, nn.Conv1d):
-            trunc_normal_(m.weight, std=0.02)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
-
-    def _compute_stft(self, iq: torch.Tensor) -> torch.Tensor:
-        length = iq.shape[-1]
-        n_fft = (self.stft_freq_bins - 1) * 2
-        window = torch.hann_window(n_fft, device=iq.device, dtype=torch.float32)
-        z = torch.complex(iq[:, 0].float(), iq[:, 1].float())
-        spec = torch.stft(
-            z, n_fft=n_fft, hop_length=1, win_length=n_fft,
-            window=window, center=True, return_complex=True,
-        )
-        return spec.abs()[:, : self.stft_freq_bins, :length].unsqueeze(1).to(dtype=iq.dtype)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        stft = self._compute_stft(x)
-        f_iq = self.stem_iq(self.bn_iq(x))
-        f_stft = self.stem_stft(self.bn_stft(stft)).squeeze(2)
-        h = self.fusion(torch.cat((f_iq, f_stft), dim=1))
-        h, _ = self.patch_lstm(h.transpose(1, 2))
-        h = h.transpose(1, 2)
-        for stage in self.stages:
-            h = stage(h)
-        return self.head(self.pool(self.norm(h)))
-
-
-def iqformer_small(num_classes: int = 11, seq_length: int = 128, **kwargs) -> IQFormer:
-    return IQFormer(num_classes=num_classes, seq_length=seq_length, layers=(1, 1, 1), embed_dims=(32, 32, 32), **kwargs)
-
-
-def iqformer_base(num_classes: int = 11, seq_length: int = 128, **kwargs) -> IQFormer:
-    return IQFormer(num_classes=num_classes, seq_length=seq_length, layers=(2, 3, 2), embed_dims=(64, 64, 64), **kwargs)
-
-
-def iqformer_large(num_classes: int = 11, seq_length: int = 128, **kwargs) -> IQFormer:
-    return IQFormer(num_classes=num_classes, seq_length=seq_length, layers=(2, 3, 2), embed_dims=(64, 96, 128), **kwargs)
+def iqformer_base(num_classes=11,seq_length=128,**kwargs):
+    return IQFormer(num_classes,seq_length,**kwargs)
+def iqformer_small(num_classes=11,seq_length=128,**kwargs):
+    return IQFormer(num_classes,seq_length,layers=(1,1,1),embed_dims=(32,32,32),**kwargs)
+def iqformer_large(num_classes=11,seq_length=128,**kwargs):
+    return IQFormer(num_classes,seq_length,layers=(2,3,2),embed_dims=(64,96,128),**kwargs)

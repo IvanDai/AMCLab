@@ -1,45 +1,24 @@
-"""Self-contained CLDNN2 (Liu et al., 2017 / AMR-Benchmark) baseline model."""
-
-from __future__ import annotations
-
-import torch
-import torch.nn as nn
-
+"""CLDNN2: native PyTorch architecture port of AMR-Benchmark."""
+from torch import nn
 
 class CLDNN2(nn.Module):
-    """Extended 3-conv + LSTM CLDNN2 architecture for IQ signals ``[B, 2, L]``."""
 
-    def __init__(
-        self,
-        num_classes: int = 11,
-        seq_length: int = 128,
-        channels: int = 64,
-        lstm_hidden: int = 64,
-        dropout: float = 0.5,
-    ):
+    def __init__(self, num_classes=11, seq_length=128, dropout=0.5):
         super().__init__()
-        self.convs = nn.Sequential(
-            nn.Conv2d(1, channels, kernel_size=(1, 8), padding=(0, 4)),
-            nn.BatchNorm2d(channels),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d((1, 2)),
-            nn.Conv2d(channels, channels, kernel_size=(2, 8), padding=(0, 4)),
-            nn.BatchNorm2d(channels),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d((1, 2)),
-            nn.Conv2d(channels, channels, kernel_size=(1, 4), padding=(0, 2)),
-            nn.BatchNorm2d(channels),
-            nn.ReLU(inplace=True),
-        )
-        self.lstm = nn.LSTM(channels, lstm_hidden, batch_first=True)
-        self.classifier = nn.Sequential(
-            nn.Linear(lstm_hidden, 128),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(128, num_classes),
-        )
+        if seq_length not in (128, 1024):
+            raise ValueError('seq_length must be 128 or 1024.')
+        self.seq_length = int(seq_length)
+        layers = []
+        for a, b, k in ((1, 256, (1, 3)), (256, 256, (2, 3)), (256, 80, (1, 3)), (80, 80, (1, 3))):
+            layers.extend((nn.Sequential(nn.Conv2d(a, b, k, padding=0), nn.ReLU()), nn.Dropout(dropout)))
+        self.features = nn.Sequential(*layers)
+        self.lstm = nn.LSTM(seq_length - 8, 50, batch_first=True)
+        self.classifier = nn.Sequential(nn.Linear(50, 128), nn.ReLU(), nn.Dropout(dropout), nn.Linear(128, num_classes))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.convs(x.unsqueeze(1)).squeeze(2)
-        out, _ = self.lstm(h.transpose(1, 2))
-        return self.classifier(out[:, -1, :])
+    def forward(self, x):
+        if x.ndim != 3 or x.shape[1:] != (2, self.seq_length):
+            raise ValueError(f'Expected [B,2,{self.seq_length}], got {tuple(x.shape)}')
+        h = self.features(x.unsqueeze(1))
+        h = h.flatten(1).reshape(x.shape[0], 80, self.seq_length - 8)
+        h, _ = self.lstm(h)
+        return self.classifier(h[:, -1])

@@ -1,50 +1,26 @@
-"""Self-contained DenseNet (Liu et al., 2017 / AMR-Benchmark) baseline model."""
-
-from __future__ import annotations
-
+"""DENSENET: native PyTorch architecture port of AMR-Benchmark."""
 import torch
-import torch.nn as nn
-
+from torch import nn
 
 class DenseNet(nn.Module):
-    """Densely Connected 1D CNN baseline for IQ signals ``[B, 2, L]``."""
 
-    def __init__(
-        self,
-        num_classes: int = 11,
-        seq_length: int = 128,
-        growth_rate: int = 32,
-        num_layers: int = 4,
-        dropout: float = 0.3,
-    ):
+    def __init__(self, num_classes=11, seq_length=128, dropout=0.6):
         super().__init__()
-        self.stem = nn.Sequential(
-            nn.Conv1d(2, growth_rate, kernel_size=7, stride=2, padding=3, bias=False),
-            nn.BatchNorm1d(growth_rate),
-            nn.ReLU(inplace=True),
-        )
-        self.layers = nn.ModuleList()
-        ch = growth_rate
-        for _ in range(num_layers):
-            self.layers.append(
-                nn.Sequential(
-                    nn.BatchNorm1d(ch),
-                    nn.ReLU(inplace=True),
-                    nn.Conv1d(ch, growth_rate, kernel_size=3, padding=1, bias=False),
-                )
-            )
-            ch += growth_rate
-        self.pool = nn.AdaptiveAvgPool1d(4)
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(ch * 4, 128),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(128, num_classes),
-        )
+        if seq_length not in (128, 1024):
+            raise ValueError('seq_length must be 128 or 1024.')
+        self.seq_length = int(seq_length)
+        self.conv1 = nn.Sequential(nn.Conv2d(1, 256, (1, 3), padding='same'), nn.ReLU())
+        self.conv2 = nn.Conv2d(256, 256, (2, 3), padding='same')
+        self.conv3 = nn.Conv2d(512, 80, (1, 3), padding='same')
+        self.conv4 = nn.Sequential(nn.Conv2d(592, 80, (1, 3), padding='same'), nn.ReLU())
+        self.drop = nn.Dropout(dropout)
+        self.classifier = nn.Sequential(nn.Linear(80 * 2 * seq_length, 128), nn.ReLU(), nn.Dropout(dropout), nn.Linear(128, num_classes))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.stem(x)
-        for layer in self.layers:
-            h = torch.cat([h, layer(h)], dim=1)
-        return self.classifier(self.pool(h))
+    def forward(self, x):
+        if x.ndim != 3 or x.shape[1:] != (2, self.seq_length):
+            raise ValueError(f'Expected [B,2,{self.seq_length}], got {tuple(x.shape)}')
+        a = self.conv1(x.unsqueeze(1))
+        b = self.conv2(a)
+        c = self.conv3(torch.cat((a, b), dim=1).relu())
+        d = self.conv4(torch.cat((a, b, c), dim=1).relu())
+        return self.classifier(self.drop(d).flatten(1))

@@ -1,70 +1,88 @@
-"""Self-contained MCNet (Huynh-The et al., IEEE TWC 2020) baseline model."""
+"""MCNet: six M-blocks and length-dependent terminal pooling.
 
-from __future__ import annotations
-
+Fixed asymmetric padding is written with native PyTorch layers. All
+strided stages have even input widths for L=128 and L=1024.
+"""
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
+from torch import nn
 
 class _MBlock(nn.Module):
-    """Multi-scale asymmetric parallel convolution block used in MCNet."""
-
-    def __init__(self, in_ch: int, out_ch: int, use_pool: bool = True):
+    def __init__(self, cin, down=False, final=False, prepool=False):
         super().__init__()
-        c_branch = out_ch // 3
-        c_last = out_ch - 2 * c_branch
-        self.b1 = nn.Conv2d(in_ch, c_branch, kernel_size=(1, 1))
-        self.b2 = nn.Sequential(
-            nn.Conv2d(in_ch, c_branch, kernel_size=(1, 1)),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(c_branch, c_branch, kernel_size=(3, 1), padding=(1, 0)),
+        self.prepool = (
+            nn.MaxPool2d((1, 3), stride=(1, 2), ceil_mode=True)
+            if prepool else nn.Identity()
         )
-        self.b3 = nn.Sequential(
-            nn.Conv2d(in_ch, c_last, kernel_size=(1, 1)),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(c_last, c_last, kernel_size=(1, 3), padding=(0, 1)),
+        self.reduce = nn.Sequential(nn.Conv2d(cin, 32, 1), nn.ReLU())
+        a, b = (96, 64) if final else (48, 32)
+        stride = (1, 2) if down else (1, 1)
+        self.vertical = nn.Sequential(
+            nn.Conv2d(32, a, (3, 1), padding=(1, 0)), nn.ReLU()
         )
-        self.pool = nn.MaxPool2d(kernel_size=(1, 2)) if use_pool else nn.Identity()
+        self.vpool = (
+            nn.MaxPool2d((1, 3), stride=(1, 2), ceil_mode=True)
+            if down else nn.Identity()
+        )
+        self.horizontal = nn.Sequential(
+            nn.ZeroPad2d((0, 1, 0, 0)) if down else nn.ZeroPad2d((1, 1, 0, 0)),
+            nn.Conv2d(32, a, (1, 3), stride=stride), nn.ReLU()
+        )
+        self.short = nn.Sequential(
+            nn.Conv2d(32, b, 1, stride=stride), nn.ReLU()
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = torch.cat([self.b1(x), self.b2(x), self.b3(x)], dim=1)
-        return F.relu(self.pool(y), inplace=True)
+    def forward(self, x):
+        x = self.reduce(self.prepool(x))
+        return torch.cat((self.short(x), self.vpool(self.vertical(x)), self.horizontal(x)), dim=1)
 
 
 class MCNet(nn.Module):
-    """MCNet with multi-scale skip blocks for IQ signals ``[B, 2, L]``."""
-
-    def __init__(
-        self,
-        num_classes: int = 11,
-        seq_length: int = 128,
-        base_channels: int = 64,
-        dropout: float = 0.2,
-    ):
+    def __init__(self, num_classes=11, seq_length=128, dropout=.5):
         super().__init__()
-        c = base_channels
-        self.stem = nn.Sequential(
-            nn.Conv2d(1, c, kernel_size=(3, 7), stride=(1, 2), padding=(1, 3)),
-            nn.BatchNorm2d(c),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=(1, 2)),
-        )
-        self.m1 = _MBlock(c, c, use_pool=True)
-        self.m2 = _MBlock(c, c, use_pool=False)
-        self.m3 = _MBlock(c, c, use_pool=True)
-        self.m4 = _MBlock(c, c, use_pool=False)
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.head = nn.Sequential(
-            nn.Flatten(),
-            nn.Dropout(dropout),
-            nn.Linear(c, num_classes),
-        )
+        if seq_length not in (128, 1024):
+            raise ValueError("seq_length must be 128 or 1024.")
+        self.seq_length = seq_length
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.stem(x.unsqueeze(1))
-        h = self.m1(h)
-        h = h + self.m2(h)
-        h = self.m3(h)
-        h = h + self.m4(h)
-        return self.head(self.pool(h))
+        self.stem = nn.Sequential(
+            nn.ZeroPad2d((2, 3, 1, 1)),
+            nn.Conv2d(1, 64, (3, 7), stride=(1, 2)), nn.ReLU(),
+            nn.MaxPool2d((1, 3), stride=(1, 2), ceil_mode=True),
+        )
+        self.pre1 = nn.Sequential(
+            nn.Conv2d(64, 32, (3, 1), padding=(1, 0)), nn.ReLU(),
+            nn.AvgPool2d((1, 3), stride=(1, 2), ceil_mode=True, count_include_pad=False),
+        )
+        self.pre2 = nn.Sequential(
+            nn.ZeroPad2d((0, 1, 0, 0)),
+            nn.Conv2d(64, 32, (1, 3), stride=(1, 2)), nn.ReLU(),
+        )
+        self.skip = nn.Sequential(
+            nn.Conv2d(64, 128, 1, stride=(1, 2)), nn.ReLU(),
+            nn.MaxPool2d((1, 3), stride=(1, 2), ceil_mode=True),
+        )
+        self.m1 = _MBlock(64, down=True, prepool=True)
+        self.m2 = _MBlock(128)
+        self.m3 = _MBlock(128, down=True)
+        self.m4 = _MBlock(128)
+        self.m5 = _MBlock(128, down=True)
+        self.m6 = _MBlock(128, final=True)
+        # Skip inputs are non-negative after ReLU and residual addition.
+        self.skip_pool = nn.Sequential(
+            nn.ZeroPad2d((0, 0, 0, 1)),
+            nn.MaxPool2d((2, 2), stride=(1, 2)),
+        )
+        self.last_pool = nn.AvgPool2d((2, 1 if seq_length == 128 else 8))
+        self.classifier = nn.Sequential(nn.Dropout(dropout), nn.Flatten(), nn.Linear(384, num_classes))
+
+    def forward(self, x):
+        if x.ndim != 3 or x.shape[1:] != (2, self.seq_length):
+            raise ValueError(f"Expected [B,2,{self.seq_length}], got {tuple(x.shape)}")
+        x = self.stem(x.unsqueeze(1))
+        x = torch.cat((self.pre1(x), self.pre2(x)), dim=1)
+        x = self.m1(x) + self.skip(x)
+        x = self.m2(x) + x
+        x = self.m3(x) + self.skip_pool(x)
+        x = self.m4(x) + x
+        x = self.m5(x) + self.skip_pool(x)
+        x = torch.cat((self.m6(x), x), dim=1)
+        return self.classifier(self.last_pool(x))

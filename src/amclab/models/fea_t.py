@@ -1,123 +1,101 @@
-"""Self-contained Frame-wise Embedding Aided Transformer (FEA-T, Chen et al.).
-
-Automatically scales ``patch_size`` for long sequences (e.g., L=1024 in RML2018)
-and exposes small/base variants in the same file.
+"""FEA-T, merged defaults from WestdoorSad/IQFormer FEA_T128.py and FEA_T1024.py.
+Source credits: Yantao Chen; IQFormer repository MIT (Shao Mingyuan, 2024).
+Default path uses DB-GLU-add, no talking heads or RealFormer.
 """
-
-from __future__ import annotations
-
 import torch
-import torch.nn as nn
-from torch.nn.init import trunc_normal_
-
+from torch import nn
 
 class _MHSABlock(nn.Module):
-    def __init__(self, d_model: int, d_head: int = 16, num_heads: int = 4, dropout: float = 0.0):
+    def __init__(self,dim,head_dim,heads,dropout):
         super().__init__()
-        self.num_heads = num_heads
-        self.d_head = d_head
-        self.scale = d_head ** 0.5
-        self.to_q = nn.Linear(d_model, d_head * num_heads, bias=False)
-        self.to_k = nn.Linear(d_model, d_head * num_heads, bias=False)
-        self.to_v = nn.Linear(d_model, d_head * num_heads, bias=False)
-        self.proj = nn.Linear(d_head * num_heads, d_model, bias=False)
-        self.drop = nn.Dropout(dropout)
+        self.heads,self.head_dim=heads,head_dim
+        self.scale=head_dim**.5
+        self.to_q=nn.Linear(dim,heads*head_dim,bias=False)
+        self.to_k=nn.Linear(dim,heads*head_dim,bias=False)
+        self.to_v=nn.Linear(dim,heads*head_dim,bias=False)
+        self.proj_v=nn.Linear(heads*head_dim,dim,bias=False)
+        self.Dp_attn=nn.Dropout(dropout)
+        self.Dp_v=nn.Dropout(dropout)
+    def forward(self,x):
+        b,p,_=x.shape
+        def split(y):
+            return y.reshape(b,p,self.heads,self.head_dim).transpose(1,2)
+        q=split(self.to_q(x))/self.scale
+        k=split(self.to_k(x))
+        v=split(self.to_v(x))
+        a=self.Dp_attn((q@k.transpose(-1,-2)).softmax(-1))
+        return self.Dp_v(self.proj_v((a@v).transpose(1,2).reshape(b,p,-1)))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, p, _ = x.shape
-        q = self.to_q(x).reshape(b, p, self.num_heads, self.d_head).transpose(1, 2) / self.scale
-        k = self.to_k(x).reshape(b, p, self.num_heads, self.d_head).transpose(1, 2)
-        v = self.to_v(x).reshape(b, p, self.num_heads, self.d_head).transpose(1, 2)
-        attn = self.drop(torch.softmax(q @ k.transpose(-2, -1), dim=-1))
-        out = (attn @ v).transpose(1, 2).reshape(b, p, self.num_heads * self.d_head)
-        return self.drop(self.proj(out))
-
-
-class _DBGLUBlock(nn.Module):
-    def __init__(self, d_model: int, d_hidden: int, dropout: float = 0.0):
+class _DBGLU(nn.Module):
+    def __init__(self,dim,hidden,dropout):
         super().__init__()
-        self.half = d_hidden // 2
-        self.fc1 = nn.Linear(d_model, d_hidden)
-        self.act = nn.GELU()
-        self.drop = nn.Dropout(dropout)
-        self.fc2 = nn.Linear(self.half, d_model)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.fc1(x)
-        h1, h2 = h[..., : self.half], h[..., self.half :]
-        return self.fc2(self.drop(h1 * self.act(h2) + h2 * self.act(h1)))
-
+        if hidden%2:
+            raise ValueError("DB-GLU hidden size must be even.")
+        self.linear1=nn.Linear(dim,hidden)
+        self.linear2=nn.Linear(hidden//2,dim)
+        self.Act=nn.GELU()
+        self.dropout=nn.Dropout(dropout)
+    def forward(self,x):
+        a,b=self.linear1(x).chunk(2,dim=-1)
+        return self.linear2(self.dropout(a*self.Act(b)+b*self.Act(a)))
 
 class _TransformerLayer(nn.Module):
-    def __init__(self, d_model: int, d_head: int, d_hidden: int, num_heads: int, dropout: float):
+    def __init__(self,dim,head_dim,hidden,heads,dropout):
         super().__init__()
-        self.mhsa = _MHSABlock(d_model, d_head=d_head, num_heads=num_heads, dropout=dropout)
-        self.ffn = _DBGLUBlock(d_model, d_hidden=d_hidden, dropout=dropout)
-        self.norm1 = nn.LayerNorm(d_model, eps=1e-5)
-        self.norm2 = nn.LayerNorm(d_model, eps=1e-5)
+        self.mhsa=_MHSABlock(dim,head_dim,heads,dropout)
+        self.ffn=_DBGLU(dim,hidden,dropout)
+        self.norm_1=nn.LayerNorm(dim,eps=1e-5)
+        self.norm_2=nn.LayerNorm(dim,eps=1e-5)
+    def forward(self,x):
+        x=self.norm_1(x+self.mhsa(x))
+        return self.norm_2(x+self.ffn(x))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.norm1(x + self.mhsa(x))
-        return self.norm2(x + self.ffn(x))
-
+class _Frame(nn.Module):
+    def __init__(self,patch_size,stride):
+        super().__init__()
+        self.PatchSize,self.Stride=patch_size,stride
+        self.Embeddinbg=nn.Linear(patch_size*2,patch_size*2)
+    def forward(self,x):
+        # Vectorized upstream loop: [I frame, Q frame] (not interleaved).
+        b=x.shape[0]
+        frames=x.unfold(-1,self.PatchSize,self.Stride)
+        frames=frames.permute(0,2,1,3).reshape(b,-1,2*self.PatchSize)
+        return self.Embeddinbg(frames)
 
 class FEAT(nn.Module):
-    """Frame-wise Embedding Aided Transformer (FEA-T) for IQ signals ``[B, 2, L]``."""
-
-    def __init__(
-        self,
-        num_classes: int = 11,
-        seq_length: int = 128,
-        patch_size: int | None = None,
-        overlap: float = 0.5,
-        layer_num: int = 4,
-        num_heads: int = 4,
-        d_head: int = 16,
-        hidden_features: int = 256,
-        dropout: float = 0.0,
-    ):
+    def __init__(self,num_classes=11,seq_length=128,patch_size=None,overlap=None,
+                 layer_num=8,num_heads=4,d_head=16,hidden_features=256,dropout=0.):
         super().__init__()
-        if patch_size is None:
-            patch_size = 64 if seq_length >= 512 else 16
-        self.patch_size = int(patch_size)
-        self.stride = max(1, int(self.patch_size * overlap))
-        self.frame_num = max(1, (seq_length - self.patch_size) // self.stride + 1)
-        d_model = self.patch_size * 2
+        if seq_length not in (128, 1024):
+            raise ValueError("seq_length must be 128 or 1024.")
+        self.seq_length = int(seq_length)
+        patch_size=(16 if seq_length==128 else 32) if patch_size is None else patch_size
+        overlap=(.2 if seq_length==128 else .5) if overlap is None else overlap
+        self.patch_size=patch_size
+        self.stride=int(patch_size*overlap)
+        if self.stride<1 or patch_size>seq_length:
+            raise ValueError("Invalid frame size/stride.")
+        self.frame_num=(seq_length-patch_size)//self.stride+1
+        d=patch_size*2
+        self.cls_token=nn.Parameter(torch.zeros(1,1,d))
+        self.pos_embed=nn.Parameter(torch.zeros(1,self.frame_num+1,d))
+        self.Embedding=_Frame(patch_size,self.stride)
+        self.Enc=nn.ModuleList([_TransformerLayer(d,d_head,hidden_features,num_heads,dropout)
+                                for _ in range(layer_num)])
+        self.classifier=nn.Linear(d,num_classes)
+        nn.init.trunc_normal_(self.cls_token,std=.02)
+        nn.init.trunc_normal_(self.pos_embed,std=.02)
+    def forward(self,x):
+        if x.ndim != 3 or x.shape[1:] != (2, self.seq_length):
+            raise ValueError(f"Expected [B,2,{self.seq_length}], got {tuple(x.shape)}")
+        x=self.Embedding(x)
+        x=torch.cat((x,self.cls_token.expand(x.shape[0],-1,-1)),dim=1)+self.pos_embed
+        for enc in self.Enc:
+            x=enc(x)
+        return self.classifier(x[:,-1,:])
 
-        self.embed = nn.Linear(d_model, d_model)
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.frame_num + 1, d_model))
-        self.layers = nn.ModuleList(
-            [_TransformerLayer(d_model, d_head, hidden_features, num_heads, dropout) for _ in range(layer_num)]
-        )
-        self.classifier = nn.Linear(d_model, num_classes)
-        trunc_normal_(self.cls_token, std=0.02)
-        trunc_normal_(self.pos_embed, std=0.02)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, 2, L] -> unfold sliding frames
-        b, _, length = x.shape
-        frames = x.unfold(dimension=2, size=self.patch_size, step=self.stride)  # [B, 2, F, P]
-        frames = frames.permute(0, 2, 1, 3).reshape(b, -1, 2 * self.patch_size)
-        tokens = self.embed(frames)
-        cls = self.cls_token.expand(b, -1, -1)
-        tokens = torch.cat((tokens, cls), dim=1)
-        # Gracefully interpolate positional embeddings if runtime sequence length differs
-        if tokens.shape[1] == self.pos_embed.shape[1]:
-            tokens = tokens + self.pos_embed
-        else:
-            pe = nn.functional.interpolate(
-                self.pos_embed.transpose(1, 2), size=tokens.shape[1], mode="linear", align_corners=False
-            ).transpose(1, 2)
-            tokens = tokens + pe
-        for layer in self.layers:
-            tokens = layer(tokens)
-        return self.classifier(tokens[:, -1])
-
-
-def fea_t_small(num_classes: int = 11, seq_length: int = 128, **kwargs) -> FEAT:
-    return FEAT(num_classes=num_classes, seq_length=seq_length, layer_num=4, hidden_features=128, **kwargs)
-
-
-def fea_t_base(num_classes: int = 11, seq_length: int = 128, **kwargs) -> FEAT:
-    return FEAT(num_classes=num_classes, seq_length=seq_length, layer_num=8, hidden_features=256, **kwargs)
+FEA_T=FEAT
+def fea_t_base(num_classes=11,seq_length=128,**kwargs):
+    return FEAT(num_classes,seq_length,**kwargs)
+def fea_t_small(num_classes=11,seq_length=128,**kwargs):
+    return FEAT(num_classes,seq_length,layer_num=4,hidden_features=128,**kwargs)
