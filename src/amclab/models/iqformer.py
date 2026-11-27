@@ -238,7 +238,7 @@ def iqformer_small(num_classes: int = 11, seq_length: int = 128, **kwargs) -> IQ
 
 
 def iqformer_base(num_classes: int = 11, seq_length: int = 128, **kwargs) -> IQFormer:
-    return IQFormer(num_classes=num_classes, seq_length=seq_length, layers=(2, 2, 2), embed_dims=(64, 64, 64), **kwargs)
+    return IQFormer(num_classes=num_classes, seq_length=seq_length, layers=(2, 3, 2), embed_dims=(64, 64, 64), **kwargs)
 
 
 def iqformer_large(num_classes: int = 11, seq_length: int = 128, **kwargs) -> IQFormer:
