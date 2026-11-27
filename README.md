@@ -23,7 +23,7 @@ Python 3.9+ is specified in the package metadata. Choose a PyTorch build compati
 
 ### Option 1: Install as a Python package (recommended)
 
-Clone the repository and install it with the optional dataset dependencies:
+Clone the repository and install it:
 
 ```bash
 git clone https://github.com/IvanDai/AMCLab.git
@@ -111,9 +111,9 @@ Run the examples from the repository root after installing AMCLab:
 
 | Example | Description |
 | --- | --- |
-| [01 — Single baseline](examples/01_single_baseline_train_resume/) | Train, resume, and evaluate a built-in model. |
-| [02 — Custom model](examples/02_custom_model/) | Train and evaluate custom PyTorch model variants. |
-| [03 — Batch benchmarking](examples/03_batch_train_and_eval/) | Train multiple baselines, evaluate saved checkpoints, and export comparison tables. |
+| [01 - Single baseline](examples/01_single_baseline_train_resume/) | Train, resume, and evaluate a built-in model. |
+| [02 - Custom model](examples/02_custom_model/) | Train and evaluate custom PyTorch model variants. |
+| [03 - Batch benchmarking](examples/03_batch_train_and_eval/) | Train multiple baselines, evaluate saved checkpoints, and export comparison tables. |
 
 ```bash
 python examples/01_single_baseline_train_resume/train_and_resume.py
@@ -133,19 +133,3 @@ The examples use synthetic data by default. To run on real datasets, edit `DATAS
 AMCLab is released under the [MIT License](LICENSE).
 
 If you find AMCLab useful in your research or projects, please consider giving the repository a ⭐ [Star](https://github.com/IvanDai/AMCLab). Your support is greatly appreciated!
-
-## Repository Structure
-
-```text
-AMCLab/
-├── src/amclab/       # Core Python package
-│   ├── datasets/     # I/Q datasets and data splits
-│   ├── transforms/   # Signal preprocessing and augmentation
-│   ├── models/       # Baseline models
-│   ├── engine/       # Training, evaluation, and metrics
-│   └── utils/        # Runtime utilities
-├── examples/         # Training and benchmarking examples
-├── docs/             # Additional documentation
-├── pyproject.toml    # Package configuration
-└── requirements.txt # Dependencies
-```
