@@ -1,36 +1,106 @@
-
-.pytest_cache/
-.amrlab_mmap_cache/
-examples/runs/
-examples/outputs/
-examples/demo_data/
-
-
-# Floders
-# /Dataset/
-PRESERVED/
-
-# python
-
+# Python bytecode, caches and test artifacts
 __pycache__/
 *.py[cod]
 *$py.class
-*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Python environments and packaging
 .venv/
-*.pkl
-*.h5
-*.hdf5
+venv/
+env/
+.env
+.env.*
+!.env.example
+*.egg-info/
+.eggs/
+build/
+dist/
+*.egg
 
-# VScode
-.vscode
-
-# matab
+# IDE, editor and operating system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
 *.asv
 
-# OSX
-.DS_Store
-
-# PyTorch checkpoints
+# Local datasets, dataset caches and model weights
+/Dataset/
+/Datasets/
+/data/
+.amrlab_mmap_cache/
+.amclab_mmap_cache/
+PRESERVED/
+*.pkl
+*.pickle
+*.h5
+*.hdf5
 *.pt
+*.pth
+*.ckpt
 *.orc
+*.log
 Saves/Logs/
+
+# Default experiment output directories at repository root.
+# Examples use paths relative to the current working directory.
+# Keep all experiment artifacts in these directories.
+/runs/
+/outputs/
+/output/
+/results/
+/checkpoints/
+/logs/
+/wandb/
+/lightning_logs/
+
+# Example outputs at any depth, including when run from a subdirectory.
+/examples/**/runs/
+/examples/**/outputs/
+/examples/**/output/
+/examples/**/results/
+/examples/**/checkpoints/
+/examples/**/logs/
+/examples/**/eval/
+/examples/**/demo_data/
+/examples/**/data/
+/examples/**/wandb/
+/examples/**/lightning_logs/
+
+# Common result files generated outside the default output folders.
+# Preserve Python scripts, notebooks, Markdown and configuration files.
+/examples/**/*.csv
+/examples/**/*.tsv
+/examples/**/*.npy
+/examples/**/*.npz
+/examples/**/*.mat
+/examples/**/*.parquet
+/examples/**/*.png
+/examples/**/*.jpg
+/examples/**/*.jpeg
+/examples/**/*.svg
+/examples/**/*.pdf
+/examples/**/*.eps
+/examples/**/*.webp
+/examples/**/*.tif
+/examples/**/*.tiff
+/examples/**/*.onnx
+/examples/**/*.safetensors
+/examples/**/history.json
+/examples/**/eval_results.json
+/examples/**/metrics.json
+/examples/**/results.json
+/examples/**/summary.json
+/examples/**/predictions.json
+/examples/**/events.out.tfevents.*
+/examples/**/*.tmp
