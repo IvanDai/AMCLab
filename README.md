@@ -28,19 +28,19 @@ Clone the repository and install it with the optional dataset dependencies:
 ```bash
 git clone https://github.com/IvanDai/AMCLab.git
 cd AMCLab
-python -m pip install ".[datasets]"
+python -m pip install .
 ```
 
 For development, use editable installation instead:
 
 ```bash
-python -m pip install -e ".[datasets]"
+python -m pip install -e .
 ```
 
 You can also install directly from GitHub (requires Git):
 
 ```bash
-python -m pip install "amclab[datasets] @ git+https://github.com/IvanDai/AMCLab.git"
+python -m pip install "amclab @ git+https://github.com/IvanDai/AMCLab.git"
 ```
 
 ### Option 2: Use directly in your own project

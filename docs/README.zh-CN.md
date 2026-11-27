@@ -28,19 +28,19 @@ AMCLab 旨在减少重复编写训练代码的工作量，帮助研究者便捷�
 ```bash
 git clone https://github.com/IvanDai/AMCLab.git
 cd AMCLab
-python -m pip install ".[datasets]"
+python -m pip install .
 ```
 
 如果需要修改 AMCLab 源码，可改用可编辑安装：
 
 ```bash
-python -m pip install -e ".[datasets]"
+python -m pip install -e .
 ```
 
 也可以直接从 GitHub 安装（需要已安装 Git）：
 
 ```bash
-python -m pip install "amclab[datasets] @ git+https://github.com/IvanDai/AMCLab.git"
+python -m pip install "amclab @ git+https://github.com/IvanDai/AMCLab.git"
 ```
 
 ### 方式二：直接集成到自己的项目
