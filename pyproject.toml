@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "amclab"
+version = "0.2.2"
+description = "A clean, Keras-like PyTorch package for Automatic Modulation Classification (AMC)."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "torch>=2.0.0",
+  "numpy>=1.24.0",
+  "tqdm>=4.65.0",
+]
+
+[project.optional-dependencies]
+datasets = ["h5py>=3.8.0", "scipy>=1.10.0"]
+dev = ["pytest>=7.0.0"]
+all = ["h5py>=3.8.0", "scipy>=1.10.0", "pytest>=7.0.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

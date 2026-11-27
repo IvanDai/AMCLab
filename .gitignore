@@ -1,0 +1,36 @@
+
+.pytest_cache/
+.amrlab_mmap_cache/
+examples/runs/
+examples/outputs/
+examples/demo_data/
+
+
+# Floders
+# /Dataset/
+PRESERVED/
+
+# python
+
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+*.pkl
+*.h5
+*.hdf5
+
+# VScode
+.vscode
+
+# matab
+*.asv
+
+# OSX
+.DS_Store
+
+# PyTorch checkpoints
+*.pt
+*.orc
+Saves/Logs/
