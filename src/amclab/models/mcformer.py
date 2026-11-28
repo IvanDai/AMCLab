@@ -1,65 +1,84 @@
-"""MCFormer: convolution, four BERT-style encoders, first-four-token head.
+"""MCformer port for AMCLab, based on CSRR implementation.
 
-L=128: released MCformerLarge configuration (32 channels, kernel=65).
-L=1024: AMCLab budget-matched adaptation (48 channels, kernel=377);
-the original publication and IQFormer repository do not establish
-this long-sequence preset. Explicit width/kernel overrides are supported.
+Source:
+https://github.com/Singingkettle/ChangShuoRadioRecognition/blob/main/csrr/models/backbones/mcformer.py
+Config:
+https://github.com/Singingkettle/ChangShuoRadioRecognition/blob/main/configs/mcformer/mcformer_iq-shape-F-L-deepsig-201610A.py
+
+The backbone computation is kept faithful to CSRR:
+Conv1d(2->32,k=65,padding='same') -> ReLU ->
+4-layer TransformerEncoder (d_model=32,nhead=4,dim_feedforward=32) ->
+take first 4 sequence positions -> flatten 128 ->
+Linear(128,128) -> ReLU -> Dropout(0.5) -> Linear(128,C).
+
+Input/output adapted for AMCLab:
+[B,2,L] -> [B,C] logits.
+No positional encoding is added because the referenced implementation does not
+define one. The squeeze(dim=2) in CSRR is a no-op for L>1; omitted here without
+changing tensor values.
 """
+import torch
 from torch import nn
-
-class SelfAttentionTransformerBERT(nn.Module):
-    def __init__(self, hidden_size, num_heads, dropout_prob=.1):
-        super().__init__()
-        self.self_attn = nn.MultiheadAttention(
-            hidden_size, num_heads, dropout=dropout_prob, batch_first=True
-        )
-        self.feed_forward = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size*4), nn.GELU(),
-            nn.Linear(hidden_size*4, hidden_size), nn.Dropout(dropout_prob),
-        )
-        self.norm1 = nn.LayerNorm(hidden_size)
-        self.norm2 = nn.LayerNorm(hidden_size)
-        self.dropout = nn.Dropout(dropout_prob)
-
-    def forward(self, x):
-        y, _ = self.self_attn(x, x, x, need_weights=False)
-        x = self.norm1(x + self.dropout(y))
-        return self.norm2(x + self.dropout(self.feed_forward(x)))
 
 
 class MCFormer(nn.Module):
-    def __init__(self, num_classes=11, seq_length=128, hidden_size=None,
-                 kernel_size=None, num_heads=4):
+    def __init__(
+        self,
+        num_classes: int = 11,
+        seq_length: int = 128,
+        fea_dim: int = 128,
+        frame_length=None,
+        dropout: float = 0.5,
+        **kwargs,
+    ):
         super().__init__()
-        if seq_length not in (128, 1024):
-            raise ValueError("seq_length must be 128 or 1024.")
-        self.seq_length = seq_length
-        hidden_size = (32 if seq_length == 128 else 48) if hidden_size is None else hidden_size
-        kernel_size = (65 if seq_length == 128 else 377) if kernel_size is None else kernel_size
-        if hidden_size <= 0 or num_heads <= 0 or hidden_size % num_heads:
-            raise ValueError("hidden_size must be a positive multiple of num_heads.")
-        if not 1 <= kernel_size <= seq_length - 1:
-            raise ValueError("Need at least four post-convolution positions.")
-        self.hidden_size = hidden_size
-        self.kernel_size = kernel_size
+        if kwargs:
+            unknown = ", ".join(sorted(kwargs))
+            raise TypeError(f"Unexpected MCFormer arguments: {unknown}")
+        if frame_length is not None:
+            if seq_length != 128 and seq_length != frame_length:
+                raise ValueError("seq_length and frame_length disagree")
+            seq_length = frame_length
+        if seq_length < 4:
+            raise ValueError("MCFormer requires seq_length >= 4")
 
-        # Conv1d is equivalent to the source Conv2d with width=1.
-        self.conv_layer = nn.Conv1d(2, hidden_size, kernel_size, padding=1)
-        self.selu = nn.SELU()
-        self.transformer_layers = nn.Sequential(*(
-            SelfAttentionTransformerBERT(hidden_size, num_heads) for _ in range(4)
-        ))
-        self.flatten = nn.Flatten()
-        self.fc1 = nn.Linear(4*hidden_size, 128)
-        self.fc2 = nn.Linear(128, num_classes)
+        self.seq_length = int(seq_length)
+        self.fea_dim = int(fea_dim)
+        self.num_classes = int(num_classes)
 
-    def forward(self, x):
-        if x.ndim != 3 or x.shape[1:] != (2, self.seq_length):
-            raise ValueError(f"Expected [B,2,{self.seq_length}], got {tuple(x.shape)}")
-        x = self.selu(self.conv_layer(x)).transpose(1, 2)
-        x = self.transformer_layers(x)
-        x = self.flatten(x[:, :4, :].transpose(1, 2))
-        return self.fc2(self.selu(self.fc1(x)))
+        self.cnn = nn.Sequential(
+            nn.Conv1d(2, self.fea_dim, kernel_size=65, padding="same"),
+            nn.SELU(inplace=True),
+        )
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.fea_dim,
+            nhead=4,
+            dim_feedforward=self.fea_dim,
+            batch_first=True,
+        )
+        self.tnn = nn.TransformerEncoder(encoder_layer, num_layers=4)
+        self.classifier = nn.Sequential(
+            nn.Linear(4 * self.fea_dim, 128),
+            nn.SELU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(128, self.num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 3 or x.shape[1] != 2:
+            raise ValueError(f"Expected input [B, 2, L], got {tuple(x.shape)}")
+        if x.shape[2] != self.seq_length:
+            raise ValueError(
+                f"Model configured for L={self.seq_length}, got L={x.shape[2]}"
+            )
+
+        x = self.cnn(x)                 # [B, 32, L]
+        x = x.transpose(1, 2)           # [B, L, 32]
+        x = self.tnn(x)                 # [B, L, 32]
+        x = x[:, :4, :]                 # [B, 4, 32], faithful to CSRR
+        x = x.reshape(x.shape[0], 4 * self.fea_dim)
+        return self.classifier(x)       # [B, num_classes] logits
 
 
+# AMCLab model registry compatibility.
 MCformer = MCFormer

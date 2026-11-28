@@ -23,9 +23,12 @@ from .pet_cgdnn import PETCGDNN
 from .resnet import ResNet, resnet_base, resnet_large, resnet_small
 
 BENCHMARK_MODELS: List[str] = [
-    "cnn1", "cnn2", "ic_amcnet", "mcnet", "resnet", "densenet",
-    "gru", "lstm", "lstm_ap", "cldnn", "cldnn2", "mcldnn", "cgdnet",
-    "pet_cgdnn", "iqformer", "fea_t", "amcnet", "mcformer", "1dcnn_pf",
+    "cnn1", "cnn2", 
+    "ic_amcnet", "mcnet", "resnet", "densenet",
+    "cgdnet", "1dcnn_pf",
+    "gru", "lstm", "lstm_ap", 
+    "cldnn", "cldnn2", "mcldnn", "pet_cgdnn", 
+    "iqformer", "fea_t", "amcnet", "mcformer",
 ]
 
 MODEL_REGISTRY: Dict[str, Callable[..., nn.Module]] = {
