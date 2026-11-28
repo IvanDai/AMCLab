@@ -21,6 +21,8 @@ from .mcldnn import MCLDNN
 from .mcnet import MCNet
 from .pet_cgdnn import PETCGDNN
 from .resnet import ResNet, resnet_base, resnet_large, resnet_small
+from .ea import EANet
+from .mlea_amr import MLEAAMR
 
 BENCHMARK_MODELS: List[str] = [
     "cnn1", "cnn2", 
@@ -29,6 +31,7 @@ BENCHMARK_MODELS: List[str] = [
     "gru", "lstm", "lstm_ap", 
     "cldnn", "cldnn2", "mcldnn", "pet_cgdnn", 
     "iqformer", "fea_t", "amcnet", "mcformer",
+    "e_a","mlea_amr",
 ]
 
 MODEL_REGISTRY: Dict[str, Callable[..., nn.Module]] = {
@@ -44,6 +47,7 @@ MODEL_REGISTRY: Dict[str, Callable[..., nn.Module]] = {
     "fea_t": fea_t_base, "fea_t_small": fea_t_small, "fea_t_base": fea_t_base,
     "amcnet": AMCNet, "mcformer": MCFormer,
     "1dcnn_pf": DCNNPF, "dcnn_pf": DCNNPF,
+    "e_a":EANet,"mlea_amr":MLEAAMR,
 }
 
 def list_models(canonical_only: bool = False) -> List[str]:
@@ -61,5 +65,6 @@ __all__ = [
     "CLDNN", "CLDNN2", "MCLDNN", "CGDNet", "PETCGDNN",
     "IQFormer", "iqformer_small", "iqformer_base", "iqformer_large",
     "FEAT", "fea_t_small", "fea_t_base", "AMCNet", "MCFormer", "DCNNPF",
+    "EANet","MLEAAMR",
     "BENCHMARK_MODELS", "MODEL_REGISTRY", "list_models", "get_model",
 ]
