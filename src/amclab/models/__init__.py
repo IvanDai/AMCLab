@@ -1,6 +1,6 @@
 """Built-in standalone PyTorch AMC models."""
 from __future__ import annotations
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Mapping,Optional
 import torch.nn as nn
 
 from .amcnet import AMCNet
@@ -50,14 +50,38 @@ MODEL_REGISTRY: Dict[str, Callable[..., nn.Module]] = {
     "e_a":EANet,"mlea_amr":MLEAAMR,
 }
 
-def list_models(canonical_only: bool = False) -> List[str]:
-    return list(BENCHMARK_MODELS) if canonical_only else sorted(MODEL_REGISTRY)
+def list_models(
+    canonical_only: bool = False,
+    registry: Optional[Mapping[str, Callable[..., nn.Module]]] = None,
+) -> List[str]:
+    active_registry = MODEL_REGISTRY if registry is None else registry
+    if canonical_only:
+        return list(BENCHMARK_MODELS)
+    return sorted(active_registry.keys())
 
-def get_model(name: str, num_classes: int, seq_length: int = 128, **kwargs: Any) -> nn.Module:
+
+def get_model(
+    name: str,
+    num_classes: int,
+    seq_length: int = 128,
+    registry: Optional[Mapping[str, Callable[..., nn.Module]]] = None,
+    **kwargs: Any,
+) -> nn.Module:
+    # Use built-in registry by default.
+    active_registry = MODEL_REGISTRY if registry is None else registry
     key = name.strip().lower().replace("-", "_")
-    if key not in MODEL_REGISTRY:
-        raise ValueError(f"Unknown model '{name}'. Available models: {list_models()}")
-    return MODEL_REGISTRY[key](num_classes=num_classes, seq_length=seq_length, **kwargs)
+    if key not in active_registry:
+        raise ValueError(
+            f"Unknown model '{name}'. "
+            f"Available models: {sorted(active_registry.keys())}"
+        )
+    model_cls = active_registry[key]
+    return model_cls(
+        num_classes=num_classes,
+        seq_length=seq_length,
+        **kwargs
+    )
+
 
 __all__ = [
     "CNN1", "CNN2", "ICAMCNet", "MCNet", "ResNet", "resnet_small",
